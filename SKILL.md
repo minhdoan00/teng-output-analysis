@@ -52,14 +52,17 @@ $$I_{\text{SC}}(\mu\text{A}) = \frac{V_{\text{raw}} \times \text{UNIT\_V}}{R_{\t
 | Parameter | Symbol | Default Value | Description |
 | :--- | :---: | :---: | :--- |
 | `CSV_VOLTAGE_UNIT` | $\text{UNIT\_V}$ | `"mV"` ($10^{-3}\text{ V}$) | Unit of raw Column 2 values (`"V"`, `"mV"`, `"uV"`) |
-| `R_SHUNT_OHM` | $R_{\text{shunt}}$ | $100\times 10^3\ \Omega$ | Shunt resistance ($100\text{ k}\Omega$) |
+| `R_SHUNT_OHM` | $R_{\text{shunt}}$ | $100\times 10^3\ \Omega$ | Shunt resistance ($100\text{ k}\Omega$ for standard, $10\text{ k}\Omega$ for repeat/high-current) |
 | `AMP_GAIN` | $G_{\text{amp}}$ | $10.0$ | Current preamplifier gain ($\times 10$) |
 | `PROBE_ATTEN` | $P_{\text{phys}}$ | $10.0$ | Physical probe attenuation ratio ($\times 10$) |
 | `OSC_PROBE_SETTING` | $P_{\text{osc}}$ | $10.0$ | Oscilloscope probe ratio setting ($\times 10$) |
 | `VOC_MULTIPLIER` | $M_{\text{Voc}}$ | $1.0$ | Additional multiplier for $V_{\text{OC}}$ probe |
 | `AREA_CM2` | $A$ | $25.0\text{ cm}^2$ | Active triboelectric contact area ($5\times 5\text{ cm}$) |
 
-With default parameters: $R_{\text{trans}} = 10^6\text{ V/A} = 1\text{ V}/\mu\text{A} = 1000\text{ mV}/\mu\text{A}$, so $1\text{ mV}$ raw reading equals $0.001\ \mu\text{A}$ ($1\text{ nA}$).
+**Shunt Resistor Selection & Conversion Scaling**:
+- **Standard ($R_{\text{shunt}} = 100\text{ k}\Omega$)**: $R_{\text{trans}} = 10^6\text{ V/A} = 1\text{ V}/\mu\text{A} = 1000\text{ mV}/\mu\text{A} \implies 1\text{ mV}_{\text{raw}} \leftrightarrow 1\text{ nA} = 0.001\ \mu\text{A}$.
+- **High-Current / Repeat ($R_{\text{shunt}} = 10\text{ k}\Omega$)**: $R_{\text{trans}} = 10^5\text{ V/A} = 0.1\text{ V}/\mu\text{A} = 100\text{ mV}/\mu\text{A} \implies 1\text{ mV}_{\text{raw}} \leftrightarrow 10\text{ nA} = 0.01\ \mu\text{A}$ ($10\times$ current conversion).
+- **Auto-Correction Rule for Repeat Measurements & Sub-$5\ \mu\text{A}$ Traces**: In multi-run experiments (such as electrospun composite TENG batches), repeat measurements often switch to $R_{\text{shunt}} = 10\text{ k}\Omega$. If an $I_{\text{SC}}$ file has `"repeat"` in its name or if the calculated $I_{\text{pp}} < 5.0\ \mu\text{A}$ under $100\text{ k}\Omega$, the pipeline automatically re-scales with $R_{\text{shunt}} = 10\text{ k}\Omega$ and logs the parameter in the output summary.
 
 ### 2. Open-Circuit Voltage Scaling (`Voc`)
 $$V_{\text{OC}}(\text{V}) = V_{\text{raw}} \times \text{UNIT\_V} \times \text{VOC\_MULTIPLIER}$$
@@ -166,8 +169,8 @@ A complete, standalone Python implementation combining both the **Origin-Style P
 # 1. Analyze a single CSV file (Origin plot + 4-panel Qsc diagnostic)
 python scripts/teng_analyzer.py single --input Data/Vol-Cur/Cur_B3-E5.csv --kind Isc --lang vi --qsc-diag
 
-# 2. Batch process a folder of oscilloscope CSV files (window 1.0s -> 7.0s)
-python scripts/teng_analyzer.py folder --input Data/Vol-Cur --t-start 1.0 --t-end 7.0 --lang vi
+# 2. Batch process a folder of oscilloscope CSV files (window 2.0s -> 7.0s, with custom R_shunt options)
+python scripts/teng_analyzer.py folder --input Data/Vol-Cur --t-start 2.0 --t-end 7.0 --lang vi --r-shunt 100000 --r-shunt-repeat 10000
 
 # 3. Batch process a multi-column Excel workbook (e.g., Book1.xlsx -> Data/NIPS)
 python scripts/teng_analyzer.py excel --input Data/Book1.xlsx --outdir Data/NIPS --t-start 1.0 --t-end 7.0 --lang vi

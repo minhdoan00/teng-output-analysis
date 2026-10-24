@@ -221,13 +221,13 @@ def auto_detect_signal_kind(path, df=None, meta=None, peer_vb_uV=None):
     return ("Voc" if ptp_mV >= 5500.0 else "Isc"), "AMBIGUOUS", f"No voltbase, intermediate ptp={ptp_mV:.0f}mV (Ambiguous: confirm with user)", evidence
 
 
-def to_signal(df, kind):
+def to_signal(df, kind, r_shunt_ohm=R_SHUNT_OHM):
     """Convert raw Column 2 reading to physical units (V for Voc, uA for Isc/Qsc)."""
     out = df.copy()
     scale = (
         UNIT_V[CSV_VOLTAGE_UNIT] * VOC_MULTIPLIER
         if kind == "Voc"
-        else current_scale_uA()
+        else current_scale_uA(r_shunt_ohm=r_shunt_ohm)
     )
     out["y"] = out["raw"] * scale
     return out
@@ -604,8 +604,16 @@ def analyze_teng_qsc_cycles(sub_df, area_cm2=AREA_CM2, min_peak_uA=MIN_PEAK_ISC_
 # ==============================================================================
 # 4. PIPELINE & STATISTICAL AGGREGATION
 # ==============================================================================
-def analyze_file(path, kind="auto", window=None, preview=False, peer_vb_uV=None):
-    """Analyze a single oscilloscope CSV file for Voc, Isc, or Qsc (with probabilistic confidence assessment)."""
+def analyze_file(
+    path,
+    kind="auto",
+    window=None,
+    preview=False,
+    peer_vb_uV=None,
+    r_shunt_ohm=None,
+    auto_rshunt_sub5ua=False,
+):
+    """Analyze a single oscilloscope CSV file for Voc, Isc, or Qsc (with probabilistic confidence assessment & R_shunt handling)."""
     df_raw, meta = load_oscilloscope_csv(path, return_meta=True)
     if kind is None or str(kind).lower() == "auto":
         kind, confidence, detect_reason, evidence = auto_detect_signal_kind(
@@ -615,15 +623,36 @@ def analyze_file(path, kind="auto", window=None, preview=False, peer_vb_uV=None)
         confidence = "EXPLICIT"
         detect_reason = "explicit"
         evidence = {"explicit_kind": kind}
-    df = to_signal(df_raw, kind)
+
+    active_rshunt = r_shunt_ohm if r_shunt_ohm is not None else R_SHUNT_OHM
+    df = to_signal(df_raw, kind, r_shunt_ohm=active_rshunt)
     sub, info = active_window_and_baseline(df, window)
     info["confidence"] = confidence
     info["detect_reason"] = detect_reason
     info["evidence"] = evidence
     info["voltbase_uV"] = meta.get("voltbase_uV")
+    info["r_shunt_ohm"] = active_rshunt
+
     pos, neg = detect_peaks(sub, info["dt"], kind)
     t, v = sub["t_s"].values, sub["yc"].values
     pairs = pair_peaks(t, v, pos, neg)
+
+    # Auto-adjust R_shunt if peak-to-peak current is below 5 uA and auto_rshunt_sub5ua is requested
+    if kind in ("Isc", "Qsc") and auto_rshunt_sub5ua and r_shunt_ohm is None:
+        initial_pp = float(pairs["pp"].mean()) if len(pairs) > 0 else float(np.ptp(v))
+        if initial_pp < 5.0 and active_rshunt == 100e3:
+            active_rshunt = 10e3  # Switch to 10 kOhm
+            df = to_signal(df_raw, kind, r_shunt_ohm=active_rshunt)
+            sub, info = active_window_and_baseline(df, window)
+            info["confidence"] = confidence
+            info["detect_reason"] = detect_reason + " | Auto-adjusted Rshunt=10kOhm (sub-5uA rule)"
+            info["evidence"] = evidence
+            info["voltbase_uV"] = meta.get("voltbase_uV")
+            info["r_shunt_ohm"] = active_rshunt
+            pos, neg = detect_peaks(sub, info["dt"], kind)
+            t, v = sub["t_s"].values, sub["yc"].values
+            pairs = pair_peaks(t, v, pos, neg)
+
     qtrace = None
     if kind == "Qsc" and len(pairs):
         pairs, qtrace = charge_per_cycle(sub, pairs)
@@ -645,7 +674,7 @@ def analyze_file(path, kind="auto", window=None, preview=False, peer_vb_uV=None)
         path=path,
         kind=kind,
         confidence=confidence,
-        detect_reason=detect_reason,
+        detect_reason=info.get("detect_reason", detect_reason),
         evidence=evidence,
         x=x,
         y=y,
@@ -931,8 +960,11 @@ def batch_process_folder(
     window=(DEFAULT_T_START, DEFAULT_T_END),
     lang="vi",
     date_tag=None,
+    r_shunt_ohm=None,
+    auto_rshunt_sub5ua=True,
+    r_shunt_repeat=10e3,
 ):
-    """Batch-process all oscilloscope CSV files in a folder with automatic Voc/Isc recognition."""
+    """Batch-process all oscilloscope CSV files in a folder with automatic Voc/Isc recognition and adaptive R_shunt."""
     if date_tag is None:
         date_tag = datetime.date.today().strftime("%Y%m%d")
     if out_dir is None:
@@ -969,9 +1001,28 @@ def batch_process_folder(
         kind, confidence, detect_reason, evidence = auto_detect_signal_kind(
             full_path, df=df_raw, meta=meta, peer_vb_uV=peer_vb
         )
-        res = analyze_file(full_path, kind=kind, window=window, preview=False, peer_vb_uV=peer_vb)
+
+        # Check if repeat condition applies to R_shunt for current
+        is_repeat_file = any(k in base_name.lower() for k in ["repeat", "3008", "lan2"])
+        if is_repeat_file and r_shunt_repeat is not None and kind in ("Isc", "Qsc"):
+            target_rshunt = r_shunt_repeat
+            rshunt_note = f"Explicit repeat rule: Rshunt={target_rshunt/1e3:g}kOhm"
+        else:
+            target_rshunt = r_shunt_ohm
+            rshunt_note = None
+
+        res = analyze_file(
+            full_path,
+            kind=kind,
+            window=window,
+            preview=False,
+            peer_vb_uV=peer_vb,
+            r_shunt_ohm=target_rshunt,
+            auto_rshunt_sub5ua=auto_rshunt_sub5ua,
+        )
         res["confidence"] = confidence
-        res["detect_reason"] = detect_reason
+        if rshunt_note and target_rshunt is not None:
+            res["detect_reason"] = f"{res.get('detect_reason', '')} | {rshunt_note}"
 
         low_base = base_name.lower()
         if low_base.startswith("vol") or low_base.startswith("cur") or low_base.startswith("qsc"):
@@ -1000,11 +1051,14 @@ def batch_process_folder(
             m_neg = float(np.min(res["y"]))
             n_cyc = 0
 
+        active_rshunt_val = res["info"].get("r_shunt_ohm", R_SHUNT_OHM)
+
         summary_rows.append({
             "Data": base_name,
             "Type": kind,
+            "R_shunt_kOhm": round(active_rshunt_val / 1000.0, 1) if kind in ("Isc", "Qsc") else np.nan,
             "Confidence": confidence,
-            "Detection_Rule": detect_reason,
+            "Detection_Rule": res.get("detect_reason", detect_reason),
             "Peak_Peak_Mean": round(m_pp, 3),
             "Peak_Peak_Std": round(s_pp, 3) if not np.isnan(s_pp) else np.nan,
             "Unit": unit,
@@ -1150,6 +1204,8 @@ def main():
     p_single.add_argument("--t-start", type=float, default=DEFAULT_T_START)
     p_single.add_argument("--t-end", type=float, default=DEFAULT_T_END)
     p_single.add_argument("--lang", choices=["vi", "en"], default="vi")
+    p_single.add_argument("--r-shunt", type=float, default=None, help="Shunt resistance in Ohm (e.g. 100000 or 10000)")
+    p_single.add_argument("--auto-rshunt-sub5ua", action="store_true", default=True, help="Auto-switch to 10kOhm if calculated Isc < 5uA")
     p_single.add_argument("--qsc-diag", action="store_true", help="Also generate 4-panel Qsc diagnostic figure")
 
     # Folder batch mode
@@ -1159,6 +1215,9 @@ def main():
     p_folder.add_argument("--t-start", type=float, default=DEFAULT_T_START)
     p_folder.add_argument("--t-end", type=float, default=DEFAULT_T_END)
     p_folder.add_argument("--lang", choices=["vi", "en"], default="vi")
+    p_folder.add_argument("--r-shunt", type=float, default=None, help="Default shunt resistance in Ohm")
+    p_folder.add_argument("--r-shunt-repeat", type=float, default=10e3, help="Shunt resistance for repeat files in Ohm (default 10kOhm)")
+    p_folder.add_argument("--no-auto-rshunt", action="store_true", help="Disable auto 10kOhm switch for sub-5uA current signals")
 
     # Excel batch mode
     p_excel = subparsers.add_parser("excel", help="Batch-process a multi-column Excel file")
@@ -1174,7 +1233,14 @@ def main():
     if args.mode == "single":
         os.makedirs(args.outdir, exist_ok=True)
         base = os.path.splitext(os.path.basename(args.input))[0]
-        res = analyze_file(args.input, args.kind, window=win, preview=False)
+        res = analyze_file(
+            args.input,
+            args.kind,
+            window=win,
+            preview=False,
+            r_shunt_ohm=args.r_shunt,
+            auto_rshunt_sub5ua=args.auto_rshunt_sub5ua,
+        )
         det_kind = res["kind"]
         out_png = os.path.join(args.outdir, f"{det_kind}_{base}_origin_plot.png")
         origin_plot([res], [base], det_kind, args.lang, out_png, show_pp=True)
@@ -1194,7 +1260,16 @@ def main():
             print(f"Saved Qsc cycle table: {cycles_csv}")
 
     elif args.mode == "folder":
-        df = batch_process_folder(args.input, out_dir=args.outdir, window=win, lang=args.lang)
+        auto_rshunt = not args.no_auto_rshunt
+        df = batch_process_folder(
+            args.input,
+            out_dir=args.outdir,
+            window=win,
+            lang=args.lang,
+            r_shunt_ohm=args.r_shunt,
+            r_shunt_repeat=args.r_shunt_repeat,
+            auto_rshunt_sub5ua=auto_rshunt,
+        )
         print(df.to_string(index=False))
 
     elif args.mode == "excel":
