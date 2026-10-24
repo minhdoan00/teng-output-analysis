@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+draft_png/
+*.png
+*.csv
+!requirements.txt
+
